@@ -1,4 +1,5 @@
 streamlit
+psycopg2-binary
 pdfplumber
 python-docx
 pandas
