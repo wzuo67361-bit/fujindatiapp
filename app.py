@@ -12,7 +12,7 @@ from pathlib import Path
 from datetime import datetime
 
 st.set_page_config(
-    page_title="海口边检辅警刷题系统",
+    page_title="边检辅警刷题系统",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
@@ -35,7 +35,6 @@ if "show_case_answer" not in st.session_state:
     st.session_state.show_case_answer = False
 
 
-# ============ 数据库连接池 ============
 @st.cache_resource
 def get_pool():
     return pool.SimpleConnectionPool(1, 5, st.secrets["DATABASE_URL"])
@@ -55,7 +54,6 @@ def db_cursor():
         p.putconn(conn)
 
 
-# ============ 工具函数 ============
 def normalize_stem_for_dedup(stem):
     if not stem:
         return ""
@@ -169,7 +167,6 @@ def parse_options_from_content(content):
     return content, []
 
 
-# ============ 建表（只跑一次） ============
 @st.cache_resource
 def init_db_once():
     with db_cursor() as (conn, c):
@@ -208,7 +205,6 @@ def init_db_once():
 init_db_once()
 
 
-# ============ 缓存：一次性加载题库和进度到内存 ============
 def load_all_to_cache():
     with db_cursor() as (conn, c):
         c.execute("SELECT id, qtype, stem, options, answer, explanation, batch FROM questions")
@@ -243,7 +239,6 @@ def invalidate_cache():
     load_all_to_cache()
 
 
-# ============ 异步写入 ============
 def _async_write_answer(qid, user_answer, is_correct):
     def worker():
         try:
@@ -274,7 +269,6 @@ def _async_write_answer(qid, user_answer, is_correct):
     t.start()
 
 
-# ============ 从缓存读取 ============
 def get_question_by_id_cached(qid):
     return st.session_state.questions_cache.get(qid)
 
@@ -364,7 +358,258 @@ def count_bad_options_cached():
     return bad
 
 
-# ============ 解析文档 ============
+# ============ 解析相关 ============
+def _section_to_qtype(header):
+    if not header:
+        return None
+    h = header
+    if "多" in h and "选" in h:
+        return "多选"
+    if "单" in h and "选" in h:
+        return "单选"
+    if "判断" in h or "对错" in h:
+        return "判断"
+    if any(k in h for k in ["填空", "简答", "案例", "论述", "名词解释", "分析", "综合应用", "综合题", "问答"]):
+        return "简答/案例"
+    return None
+
+
+def _split_sections_by_header(text):
+    pattern = re.compile(r'(?:^|\n)\s*[一二三四五六七八九十]+、\s*([^\n]+?)\s*(?:\n|$)')
+    result = []
+    last_end = 0
+    last_header = None
+    for m in pattern.finditer(text):
+        content = text[last_end:m.start()].strip()
+        if content or last_header is not None:
+            result.append((last_header, content))
+        last_header = m.group(1).strip()
+        last_end = m.end()
+    result.append((last_header, text[last_end:].strip()))
+    return result
+
+
+def _split_choice_answer(body):
+    m = re.search(r'[\[【]\s*解\s*析\s*[\]】]', body)
+    if m:
+        ans_part = body[:m.start()].strip()
+        exp = body[m.end():].strip()
+    else:
+        m2 = re.search(r'\n?\s*解\s*析\s*[：:]', body)
+        if m2:
+            ans_part = body[:m2.start()].strip()
+            exp = body[m2.end():].strip()
+        else:
+            ans_part = body
+            exp = ""
+    letters = re.findall(r'[A-Ea-e]', ans_part)
+    answer = "".join(sorted(set(L.upper() for L in letters)))
+    return answer, exp
+
+
+def _split_judge_answer(body):
+    m = re.match(r'\s*[（(\[【]?\s*([√×✓✗TFtf]|正确|错误|对|错)', body)
+    if m:
+        s = m.group(1)
+        if s in ["√", "✓", "T", "t", "正确", "对"]:
+            answer = "正确"
+        else:
+            answer = "错误"
+        rest = body[m.end():].strip()
+        rest = re.sub(r'^\s*[）)\]】]\s*', '', rest)
+        return answer, rest.strip()
+    return "", body
+
+
+def _split_short_answer(body):
+    m = re.search(r'\n?\s*答\s*[：:]', body)
+    if m:
+        exp = body[m.end():].strip()
+        return exp, ""
+    return body, ""
+
+
+def _parse_answer_section(text):
+    result = {}
+    sections = _split_sections_by_header(text)
+    for header, content in sections:
+        qtype = _section_to_qtype(header) or "单选"
+        items = re.split(r'(?<![0-9])(\d{1,3})[\.、]\s*', content)
+        for j in range(1, len(items), 2):
+            try:
+                num = int(items[j])
+            except ValueError:
+                continue
+            body = items[j + 1].strip() if j + 1 < len(items) else ""
+            if not body:
+                continue
+            if qtype == "简答/案例":
+                ans, exp = _split_short_answer(body)
+            elif qtype == "判断":
+                ans, exp = _split_judge_answer(body)
+            else:
+                ans, exp = _split_choice_answer(body)
+            result[(qtype, num)] = (ans, exp)
+    return result
+
+
+def _detect_qtype_from_answer_and_options(options, answer):
+    ans_upper = (answer or "").strip().upper()
+    if not options:
+        if ans_upper in ["正确", "错误"]:
+            return "判断"
+        return "简答/案例" if ans_upper else "判断"
+    if len(ans_upper) > 1 and all(c in "ABCDE" for c in ans_upper):
+        return "多选"
+    return "单选"
+
+
+def _parse_question_section_with_answers(text, answers_map):
+    questions = []
+    sections = _split_sections_by_header(text)
+    fallback_qtype = "单选"
+    for header, content in sections:
+        qtype = _section_to_qtype(header)
+        if qtype:
+            fallback_qtype = qtype
+        else:
+            qtype = fallback_qtype
+        items = re.split(r'(?<![0-9])(\d{1,3})[\.、]\s*', content)
+        for j in range(1, len(items), 2):
+            try:
+                num = int(items[j])
+            except ValueError:
+                continue
+            body = items[j + 1].strip() if j + 1 < len(items) else ""
+            if not body:
+                continue
+            stem, options = parse_options_from_content(body)
+            stem = clean_stem(stem).strip("【】[]()（） \n\r\t")
+            options = [clean_stem(o).strip("【】[]()（） \n\r\t") for o in options]
+            stem = re.sub(r'[一二三四五六七八九十]+、[^\n]{2,40}$', '', stem).strip()
+            if not stem:
+                continue
+            answer, explanation = "", ""
+            if (qtype, num) in answers_map:
+                answer, explanation = answers_map[(qtype, num)]
+            else:
+                for alt in ["单选", "多选", "判断", "简答/案例"]:
+                    if (alt, num) in answers_map:
+                        answer, explanation = answers_map[(alt, num)]
+                        break
+            final_type = qtype if qtype else _detect_qtype_from_answer_and_options(options, answer)
+            if final_type == "单选" and options and len((answer or "").upper()) > 1 and all(c in "ABCDE" for c in (answer or "").upper()):
+                final_type = "多选"
+            if final_type == "判断" and answer and answer not in ["正确", "错误"]:
+                final_type = "简答/案例"
+            questions.append({
+                "qtype": final_type, "stem": stem, "options": options,
+                "answer": answer, "explanation": explanation,
+            })
+    return questions
+
+
+def _parse_inline_qa(text):
+    questions = []
+    parts = re.split(
+        r'(?<![0-9])(\d{1,3})[\.、]\s*(?=[\u4e00-\u9fa5A-Za-z（(【])',
+        text
+    )
+    blocks = []
+    if parts and parts[0].strip():
+        blocks.append((None, parts[0].strip()))
+    for i in range(1, len(parts), 2):
+        num = parts[i]
+        content = parts[i + 1] if i + 1 < len(parts) else ""
+        blocks.append((num, content.strip()))
+    for num, content in blocks:
+        if not content:
+            continue
+        # 找【答案】或"答案"
+        ans_match = re.search(
+            r'(?:参考)?答案\s*[\]】\)]?\s*[:：]?\s*(.+?)'
+            r'(?=【\s*解析\s*】|解析\s*[：:]|\n\s*\d+[\.、]|$)',
+            content, re.S
+        )
+        answer = ""
+        if ans_match:
+            ans_text = ans_match.group(1).strip()
+            # 去掉外层括号
+            ans_text = ans_text.strip("【】[]()（） \n\r\t")
+            letters = re.findall(r'[A-Ea-e]', ans_text)
+            if letters:
+                answer = "".join(sorted(set(L.upper() for L in letters)))
+            else:
+                # 判断正误
+                if any(c in ans_text for c in ["×", "✗", "错"]):
+                    answer = "错误"
+                elif any(c in ans_text for c in ["√", "✓", "对", "正确"]):
+                    answer = "正确"
+                else:
+                    # 简答/填空题的答案就是文本
+                    answer = ans_text
+            content = content[:ans_match.start()].strip()
+        exp_match = re.search(r'【\s*解析\s*】\s*|解析\s*[：:]\s*', content)
+        explanation = ""
+        if exp_match:
+            explanation = content[exp_match.end():].strip()
+            content = content[:exp_match.start()].strip()
+        stem, options = parse_options_from_content(content)
+        stem = clean_stem(stem).strip("【】[]()（） \n\r\t")
+        options = [clean_stem(o).strip("【】[]()（） \n\r\t") for o in options]
+        stem = re.sub(r'[一二三四五六七八九十]+、[^\n]{2,40}$', '', stem).strip()
+        if not stem:
+            continue
+        ans_upper = answer.strip().upper() if answer else ""
+        if not options:
+            if ans_upper in ["正确", "错误"]:
+                qtype = "判断"
+            elif answer:
+                qtype = "简答/案例"
+            else:
+                qtype = "判断"
+        else:
+            if len(ans_upper) > 1 and all(c in "ABCDE" for c in ans_upper):
+                qtype = "多选"
+            else:
+                qtype = "单选"
+        questions.append({
+            "qtype": qtype, "stem": stem, "options": options,
+            "answer": answer, "explanation": explanation,
+        })
+    return questions
+
+
+def parse_text(text):
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    # 优先尝试内联式（题目自带答案）
+    inline_qs = _parse_inline_qa(text)
+    inline_total = len(inline_qs)
+    inline_answered = sum(1 for q in inline_qs if q["answer"])
+
+    # 如果大部分题都有答案，直接用内联式
+    if inline_total > 0 and inline_answered >= inline_total * 0.5:
+        return inline_qs
+
+    # 内联式不行，尝试分离式（题目和答案分开）
+    m = re.search(
+        r'(?:^|\n)\s*(?:标准)?\s*参[考考]?\s*答\s*案(?:\s*与\s*解\s*析|\s*及\s*解\s*析)?\s*(?:\n|$)',
+        text
+    )
+    if m:
+        questions_text = text[:m.start()]
+        answers_text = text[m.end():]
+        answers_map = _parse_answer_section(answers_text)
+        if answers_map:
+            sep_qs = _parse_question_section_with_answers(questions_text, answers_map)
+            sep_answered = sum(1 for q in sep_qs if q["answer"])
+            if sep_answered > inline_answered:
+                return sep_qs
+
+    return inline_qs
+
+
 def parse_excel(file):
     df = pd.read_excel(file)
     cols = {str(c).lower().strip(): c for c in df.columns}
@@ -385,7 +630,6 @@ def parse_excel(file):
             if key.lower() in cols:
                 opt_cols.append(cols[key.lower()])
                 break
-
     questions = []
     for _, row in df.iterrows():
         stem = str(row[col_stem]).strip() if col_stem and pd.notna(row[col_stem]) else ""
@@ -408,82 +652,6 @@ def parse_excel(file):
         if qtype == "判断" and answer and answer not in ["正确", "错误", "对", "错", "√", "×", "T", "F"]:
             qtype = "简答/案例"
         questions.append({"qtype": qtype, "stem": stem, "options": options, "answer": answer, "explanation": explanation})
-    return questions
-
-
-def parse_text(text):
-    """按题号切分整个文本（即使题号不在行首）。"""
-    questions = []
-    text = text.replace('\r\n', '\n').replace('\r', '\n')
-
-    parts = re.split(
-        r'(?<![0-9])(\d{1,3})[\.、]\s*(?=[\u4e00-\u9fa5A-Za-z（(【])',
-        text
-    )
-
-    blocks = []
-    if parts and parts[0].strip():
-        blocks.append((None, parts[0].strip()))
-    for i in range(1, len(parts), 2):
-        num = parts[i]
-        content = parts[i + 1] if i + 1 < len(parts) else ''
-        blocks.append((num, content.strip()))
-
-    for num, content in blocks:
-        if not content:
-            continue
-
-        ans_match = re.search(
-            r'(?:参考)?答案[\s：:】\]\)]*\s*(.+?)(?=\s*解析|\s*\d+[\.、]|$)',
-            content, re.S
-        )
-        answer = ""
-        if ans_match:
-            ans_text = ans_match.group(1)
-            letters = re.findall(r'[A-Ea-e]', ans_text)
-            if letters:
-                answer = "".join(sorted(set(L.upper() for L in letters)))
-            else:
-                for kw in ["正确", "错误"]:
-                    if kw in ans_text:
-                        answer = kw
-                        break
-            content = content[:ans_match.start()].strip()
-
-        exp_match = re.search(r'解析[\s：:]*\s*(.*)', content, re.S)
-        explanation = ""
-        if exp_match:
-            explanation = exp_match.group(1).strip()
-            content = content[:exp_match.start()].strip()
-
-        stem, options = parse_options_from_content(content)
-        stem = clean_stem(stem).strip('【】[]()（） \n\r\t')
-        options = [clean_stem(o).strip('【】[]()（） \n\r\t') for o in options]
-
-        stem = re.sub(r'[一二三四五六七八九十]+、[^\n]{2,40}$', '', stem).strip()
-
-        if not stem:
-            continue
-
-        ans_upper = answer.strip().upper() if answer else ""
-        if not options:
-            if ans_upper in ["正确", "错误"]:
-                qtype = "判断"
-            elif answer:
-                qtype = "简答/案例"
-            else:
-                qtype = "判断"
-        else:
-            if len(ans_upper) > 1 and all(c in "ABCDE" for c in ans_upper):
-                qtype = "多选"
-            else:
-                qtype = "单选"
-
-        questions.append({
-            "qtype": qtype, "stem": stem, "options": options,
-            "answer": answer, "explanation": explanation,
-        })
-
     return questions
 
 
@@ -528,7 +696,7 @@ def normalize_type(t, stem="", options=None):
         return "单选"
     if "判" in t or "对错" in t:
         return "判断"
-    if any(k in t for k in ["简答", "案例", "论述", "名词解释", "分析", "问答"]):
+    if any(k in t for k in ["填空", "简答", "案例", "论述", "名词解释", "分析", "综合应用", "问答"]):
         return "简答/案例"
     if any(k in stem for k in ["简答", "案例分析", "论述", "名词解释"]):
         return "简答/案例"
@@ -628,10 +796,10 @@ def extract_answer(s):
     s = str(s).strip()
     if not s:
         return ""
-    if s in ["正确", "错误", "对", "错", "√", "×", "T", "F", "t", "f"]:
-        if s in ["对", "√", "T", "t"]:
+    if s in ["正确", "错误", "对", "错", "√", "×", "T", "F", "t", "f", "✓", "✗"]:
+        if s in ["对", "√", "T", "t", "✓"]:
             return "正确"
-        if s in ["错", "×", "F", "f"]:
+        if s in ["错", "×", "F", "f", "✗"]:
             return "错误"
         return s
     letters = re.findall(r'[A-Ea-e]', s)
@@ -697,7 +865,6 @@ def _do_judge(q, user_answer):
     st.rerun()
 
 
-# ============ 界面样式 ============
 FONT_SIZES = {"标准": 18, "大": 22, "很大": 26, "特大": 30}
 
 
@@ -739,7 +906,6 @@ def inject_css():
     """, unsafe_allow_html=True)
 
 
-# ============ 界面 ============
 ensure_cache()
 inject_css()
 
@@ -756,7 +922,6 @@ with st.sidebar:
     st.session_state.font_size = FONT_SIZES[size_label]
 
 
-# ---------- 上传题库（支持多文件） ----------
 if page == "上传题库":
     st.subheader("上传带答案的题库文档")
     st.write("支持：Excel / Word / PDF / TXT")
@@ -768,19 +933,14 @@ if page == "上传题库":
 
     with st.expander("格式说明", expanded=False):
         st.markdown("""
-**Excel 建议列名：** 题型 | 题干 | 选项A | 选项B | 选项C | 选项D | 选项E | 答案 | 解析
+**支持的题库格式：**
 
-**Word / PDF / TXT 示例：**
+1. **题目自带答案**：每题后面紧跟 `【答案】A` `【解析】xxx`
+2. **题目和答案分离**：题目区在前，`参考答案与解析` 区在后
+3. **只列标准答案**（没解析）：系统会优先用题目自带的答案
 
-1. 以下哪个是海南自贸港的核心政策？（单选）A. 零关税 B. 高关税 C. 配额限制 D. 出口补贴【答案】A。解析：海南自贸港实行零关税政策。
-
-2. 以下哪些属于边检职责？（多选）A. 出入境检查 B. 交通运输工具检查 C. 户口登记 D. 口岸限定区域管理 E. 税收征管【答案】ABD。
-
-3. 海南自贸港2025年封关运作。（判断）【答案】正确。
-
-**题号可以在行首，也可以紧跟在上题解析后，都能识别。**
-
-**多文件上传：** 点击"浏览文件"，按住 Ctrl 或 Shift 可一次选多个。
+**题型支持：** 单选、多选、判断、填空、简答、分析、综合应用题。
+（填空/简答/分析/综合题归到「简答/案例分析」页，不判分，只看答案）
         """)
 
     uploaded_files = st.file_uploader(
@@ -793,7 +953,6 @@ if page == "上传题库":
         all_questions = []
         file_stats = []
         parse_errors = []
-
         with st.spinner(f"正在解析 {len(uploaded_files)} 个文件..."):
             for uf in uploaded_files:
                 try:
@@ -802,19 +961,15 @@ if page == "上传题库":
                     all_questions.extend(qs)
                 except Exception as e:
                     parse_errors.append((uf.name, str(e)))
-
         if parse_errors:
             for fname, err in parse_errors:
                 st.error(f"❌ {fname} 解析失败：{err}")
-
         if all_questions:
             st.subheader("各文件解析结果")
             for fname, cnt in file_stats:
                 st.write(f"- **{fname}**：{cnt} 道")
-
             total_parsed = len(all_questions)
             st.success(f"共解析出 **{total_parsed}** 道题")
-
             counts = {}
             bad_count = 0
             for q in all_questions:
@@ -824,14 +979,11 @@ if page == "上传题库":
             st.write("题型分布：" + "　".join([f"{k}：{v}" for k, v in counts.items()]))
             if bad_count > 0:
                 st.error(f"⚠️ {bad_count} 道题的选项没拆开。")
-
             dup_flags, dup_count = check_duplicates(all_questions)
             if dup_count > 0:
-                st.warning(f"⚠️ 有 {dup_count} 道题重复（与已有题库或本次上传的文件之间重复），导入时会自动跳过。")
-
+                st.warning(f"⚠️ 有 {dup_count} 道题重复，导入时会自动跳过。")
             default_batch = f"批量导入_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             batch_name = st.text_input("批次名称", value=default_batch)
-
             col1, col2 = st.columns(2)
             with col1:
                 if st.button("✅ 确认导入数据库", type="primary", use_container_width=True):
@@ -849,7 +1001,6 @@ if page == "上传题库":
             with col2:
                 if st.button("🗑️ 放弃", use_container_width=True):
                     st.rerun()
-
             with st.expander(f"查看全部 {total_parsed} 道（点击展开）", expanded=False):
                 for i, q in enumerate(all_questions, 1):
                     is_dup = dup_flags[i - 1] if i - 1 < len(dup_flags) else False
@@ -868,10 +1019,9 @@ if page == "上传题库":
                         st.write(f"　**解析：** {q['explanation']}")
                     st.divider()
         else:
-            st.warning("没有解析出任何题目。请检查文档格式。")
+            st.warning("没有解析出题目。")
 
 
-# ---------- 管理题库 ----------
 elif page == "管理题库":
     st.subheader("管理已导入的题库")
     batches = list_batches_from_cache()
@@ -892,7 +1042,6 @@ elif page == "管理题库":
                     st.success(f"已删除「{batch_name}」，{n} 道。")
                     st.rerun()
             st.divider()
-
     st.divider()
     st.subheader("当前题库汇总")
     counts = get_count_by_type_cached()
@@ -906,7 +1055,6 @@ elif page == "管理题库":
         bad = count_bad_options_cached()
         if bad > 0:
             st.error(f"🚨 {bad} 道题选项疑似未拆开。")
-
     st.divider()
     st.subheader("重置答题记录（保留题库）")
     if st.button("🔄 重置答题记录", type="secondary"):
@@ -914,7 +1062,6 @@ elif page == "管理题库":
             reset_answer_records()
             invalidate_cache()
         st.success("已重置。")
-
     st.divider()
     st.subheader("危险操作")
     if st.button("🚨 清空全部题库和记录", type="secondary"):
@@ -925,15 +1072,12 @@ elif page == "管理题库":
         st.rerun()
 
 
-# ---------- 开始刷题 ----------
 elif page == "开始刷题":
     stats = get_stats_cached()
     if stats["total"] == 0:
         st.warning("选择题/判断题题库为空，请先导入。")
         st.stop()
-
     mode = st.radio("刷题模式", ["顺序刷未做题", "错题复习", "随机抽题", "实战混合"], horizontal=True)
-
     if st.session_state.current_qid is None:
         if mode == "顺序刷未做题":
             qid = get_next_unseen_cached()
@@ -964,7 +1108,6 @@ elif page == "开始刷题":
             st.session_state.answered = False
             st.session_state.last_correct = None
             st.session_state.last_user_answer = ""
-
     if st.session_state.all_done_choice is not None:
         st.success("🎉 恭喜！你已经把这批题全部做完了。")
         st.write(f"总题数：{stats['total']}　已做：{stats['seen']}　错题：{stats['wrong']}　正确率：{stats['rate']}%")
@@ -988,29 +1131,23 @@ elif page == "开始刷题":
                 st.session_state.all_done_choice = None
                 st.rerun()
         st.stop()
-
     q = get_question_by_id_cached(st.session_state.current_qid)
     if q is None:
         st.session_state.current_qid = None
         st.rerun()
-
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("总题数", stats["total"])
     col2.metric("已做", stats["seen"])
     col3.metric("错题", stats["wrong"])
     col4.metric("正确率", f"{stats['rate']}%")
-
     st.divider()
     st.markdown(f"**【{q['qtype']}】第 {q['id']} 题**")
     st.markdown(f'<div class="stem-text">{html.escape(q["stem"])}</div>', unsafe_allow_html=True)
-
     options = q["options"]
-
     if q["qtype"] in ("单选", "多选") and len(options) < 2:
         st.error(f"⚠️ 这道题的选项没有拆开（只有 {len(options)} 个）。")
         st.error("请到「管理题库」清空后重新上传。")
         st.stop()
-
     if not st.session_state.answered:
         if q["qtype"] == "判断":
             col_y, col_n = st.columns(2)
@@ -1035,7 +1172,6 @@ elif page == "开始刷题":
                 letter = chr(65 + i)
                 if st.button(f"{letter}. {o}", key=f"opt_{q['id']}_{letter}", use_container_width=True):
                     _do_judge(q, letter)
-
     if st.session_state.answered:
         st.divider()
         correct = st.session_state.last_correct
@@ -1062,9 +1198,9 @@ elif page == "开始刷题":
             st.rerun()
 
 
-# ---------- 简答/案例分析 ----------
 elif page == "简答/案例分析":
-    st.subheader("简答题 / 案例分析题")
+    st.subheader("简答题 / 填空 / 案例分析 / 综合题")
+    st.write("这类题不判分，只看题和参考答案。")
     cases = [q for q in st.session_state.questions_cache.values() if q["qtype"] == "简答/案例"]
     cases.sort(key=lambda x: x["id"])
     if not cases:
@@ -1093,7 +1229,6 @@ elif page == "简答/案例分析":
             st.rerun()
 
 
-# ---------- 错题本 ----------
 elif page == "错题本":
     st.subheader("错题本")
     qs = st.session_state.questions_cache
@@ -1115,7 +1250,6 @@ elif page == "错题本":
         st.download_button("导出错题本 CSV", csv, "错题本.csv", "text/csv")
 
 
-# ---------- 统计 ----------
 elif page == "统计":
     st.subheader("答题统计")
     stats = get_stats_cached()
@@ -1125,7 +1259,6 @@ elif page == "统计":
     col3.metric("错题", stats["wrong"])
     col4.metric("总答题次数", stats["answers"])
     col5.metric("正确率", f"{stats['rate']}%")
-
     st.divider()
     st.subheader("题库构成")
     counts = get_count_by_type_cached()
@@ -1134,7 +1267,6 @@ elif page == "统计":
             st.write(f"- {k}：{v} 道")
     else:
         st.write("题库为空。")
-
     st.divider()
     if st.button("🔄 重置答题记录（保留题库）", type="secondary", use_container_width=True):
         with st.spinner("重置中..."):
