@@ -217,7 +217,6 @@ def load_all_to_cache():
         prows = c.fetchall()
         c.execute("SELECT COUNT(*), COALESCE(SUM(CASE WHEN is_correct=1 THEN 1 ELSE 0 END), 0) FROM records")
         rrow = c.fetchone()
-
     qs = {}
     for r in qrows:
         qs[r[0]] = {
@@ -244,7 +243,7 @@ def invalidate_cache():
     load_all_to_cache()
 
 
-# ============ 异步写入（后台线程） ============
+# ============ 异步写入 ============
 def _async_write_answer(qid, user_answer, is_correct):
     def worker():
         try:
@@ -365,7 +364,7 @@ def count_bad_options_cached():
     return bad
 
 
-# ============ 数据库写入操作 ============
+# ============ 解析文档 ============
 def parse_excel(file):
     df = pd.read_excel(file)
     cols = {str(c).lower().strip(): c for c in df.columns}
@@ -413,39 +412,63 @@ def parse_excel(file):
 
 
 def parse_text(text):
+    """按题号切分整个文本（即使题号不在行首）。"""
     questions = []
-    blocks = re.split(r'\n\s*(?=\d+[\.、\s])', text)
-    for block in blocks:
-        block = block.strip()
-        if not block:
+    text = text.replace('\r\n', '\n').replace('\r', '\n')
+
+    parts = re.split(
+        r'(?<![0-9])(\d{1,3})[\.、]\s*(?=[\u4e00-\u9fa5A-Za-z（(【])',
+        text
+    )
+
+    blocks = []
+    if parts and parts[0].strip():
+        blocks.append((None, parts[0].strip()))
+    for i in range(1, len(parts), 2):
+        num = parts[i]
+        content = parts[i + 1] if i + 1 < len(parts) else ''
+        blocks.append((num, content.strip()))
+
+    for num, content in blocks:
+        if not content:
             continue
-        m = re.match(r'^(\d+)[\.、\s]+(.*)', block, re.S)
-        if not m:
-            continue
-        content = m.group(2).strip()
-        ans_match = re.search(r'(?:参考)?答案[：:\s]*(.+?)(?=\n\s*解析|\n\s*\d+[\.、]|$)', content, re.S)
+
+        ans_match = re.search(
+            r'(?:参考)?答案[\s：:】\]\)]*\s*(.+?)(?=\s*解析|\s*\d+[\.、]|$)',
+            content, re.S
+        )
         answer = ""
         if ans_match:
-            answer = ans_match.group(1).strip()
+            ans_text = ans_match.group(1)
+            letters = re.findall(r'[A-Ea-e]', ans_text)
+            if letters:
+                answer = "".join(sorted(set(L.upper() for L in letters)))
+            else:
+                for kw in ["正确", "错误"]:
+                    if kw in ans_text:
+                        answer = kw
+                        break
             content = content[:ans_match.start()].strip()
-        exp_match = re.search(r'解析[：:\s]*(.*)', content, re.S)
+
+        exp_match = re.search(r'解析[\s：:]*\s*(.*)', content, re.S)
         explanation = ""
         if exp_match:
             explanation = exp_match.group(1).strip()
             content = content[:exp_match.start()].strip()
+
         stem, options = parse_options_from_content(content)
-        stem = clean_stem(stem)
-        options = [clean_stem(o) for o in options]
+        stem = clean_stem(stem).strip('【】[]()（） \n\r\t')
+        options = [clean_stem(o).strip('【】[]()（） \n\r\t') for o in options]
+
+        stem = re.sub(r'[一二三四五六七八九十]+、[^\n]{2,40}$', '', stem).strip()
+
         if not stem:
             continue
-        ans_upper = answer.strip().upper()
+
+        ans_upper = answer.strip().upper() if answer else ""
         if not options:
-            if ans_upper in ["正确", "错误", "对", "错", "√", "×", "T", "F"]:
+            if ans_upper in ["正确", "错误"]:
                 qtype = "判断"
-                if ans_upper in ["对", "√", "T"]:
-                    answer = "正确"
-                elif ans_upper in ["错", "×", "F"]:
-                    answer = "错误"
             elif answer:
                 qtype = "简答/案例"
             else:
@@ -453,11 +476,14 @@ def parse_text(text):
         else:
             if len(ans_upper) > 1 and all(c in "ABCDE" for c in ans_upper):
                 qtype = "多选"
-                answer = ans_upper
             else:
                 qtype = "单选"
-                answer = ans_upper
-        questions.append({"qtype": qtype, "stem": stem, "options": options, "answer": answer, "explanation": explanation})
+
+        questions.append({
+            "qtype": qtype, "stem": stem, "options": options,
+            "answer": answer, "explanation": explanation,
+        })
+
     return questions
 
 
@@ -644,7 +670,6 @@ def format_answer_with_text(qtype, answer_str, options):
 
 
 def _do_judge(q, user_answer):
-    """本地判分 + 更新缓存 + 异步写库，不阻塞 UI。"""
     result = judge(q["qtype"], q["answer"], user_answer)
     st.session_state.last_user_answer = user_answer
     if result is None:
@@ -731,11 +756,11 @@ with st.sidebar:
     st.session_state.font_size = FONT_SIZES[size_label]
 
 
-# ---------- 上传题库 ----------
+# ---------- 上传题库（支持多文件） ----------
 if page == "上传题库":
     st.subheader("上传带答案的题库文档")
     st.write("支持：Excel / Word / PDF / TXT")
-    st.info("📌 系统会自动去重：题干相同的题，只保留一道。")
+    st.info("📌 一次可以选择多个文件，系统会自动合并、去重。")
 
     bad = count_bad_options_cached()
     if bad > 0:
@@ -747,42 +772,64 @@ if page == "上传题库":
 
 **Word / PDF / TXT 示例：**
 
-1. 以下哪个是海南自贸港的核心政策？（单选）
-A. 零关税
-B. 高关税
-C. 配额限制
-D. 出口补贴
-答案：A
+1. 以下哪个是海南自贸港的核心政策？（单选）A. 零关税 B. 高关税 C. 配额限制 D. 出口补贴【答案】A。解析：海南自贸港实行零关税政策。
 
-**选项写法（任选）：** `A. xx`（换行） / `A.xxB.yyC.zz`（挤一行） / `A xx B xx`（空格） / `AxxBxx`（无标点）
+2. 以下哪些属于边检职责？（多选）A. 出入境检查 B. 交通运输工具检查 C. 户口登记 D. 口岸限定区域管理 E. 税收征管【答案】ABD。
+
+3. 海南自贸港2025年封关运作。（判断）【答案】正确。
+
+**题号可以在行首，也可以紧跟在上题解析后，都能识别。**
+
+**多文件上传：** 点击"浏览文件"，按住 Ctrl 或 Shift 可一次选多个。
         """)
 
-    uploaded = st.file_uploader("选择文件", type=["xlsx", "xls", "docx", "pdf", "txt"])
+    uploaded_files = st.file_uploader(
+        "选择文件（可按住 Ctrl 或 Shift 一次选多个）",
+        type=["xlsx", "xls", "docx", "pdf", "txt"],
+        accept_multiple_files=True
+    )
 
-    if uploaded:
-        with st.spinner("解析中..."):
-            try:
-                questions = parse_file(uploaded)
-            except Exception as e:
-                st.error(f"解析失败：{e}")
-                questions = []
+    if uploaded_files:
+        all_questions = []
+        file_stats = []
+        parse_errors = []
 
-        if questions:
+        with st.spinner(f"正在解析 {len(uploaded_files)} 个文件..."):
+            for uf in uploaded_files:
+                try:
+                    qs = parse_file(uf)
+                    file_stats.append((uf.name, len(qs)))
+                    all_questions.extend(qs)
+                except Exception as e:
+                    parse_errors.append((uf.name, str(e)))
+
+        if parse_errors:
+            for fname, err in parse_errors:
+                st.error(f"❌ {fname} 解析失败：{err}")
+
+        if all_questions:
+            st.subheader("各文件解析结果")
+            for fname, cnt in file_stats:
+                st.write(f"- **{fname}**：{cnt} 道")
+
+            total_parsed = len(all_questions)
+            st.success(f"共解析出 **{total_parsed}** 道题")
+
             counts = {}
             bad_count = 0
-            for q in questions:
+            for q in all_questions:
                 counts[q["qtype"]] = counts.get(q["qtype"], 0) + 1
                 if q["qtype"] in ("单选", "多选") and len(q["options"]) < 2:
                     bad_count += 1
-            st.success(f"解析出 {len(questions)} 道　" + "　".join([f"{k}：{v}" for k, v in counts.items()]))
+            st.write("题型分布：" + "　".join([f"{k}：{v}" for k, v in counts.items()]))
             if bad_count > 0:
                 st.error(f"⚠️ {bad_count} 道题的选项没拆开。")
 
-            dup_flags, dup_count = check_duplicates(questions)
+            dup_flags, dup_count = check_duplicates(all_questions)
             if dup_count > 0:
-                st.warning(f"⚠️ {dup_count} 道题与已有题库重复，导入时会跳过。")
+                st.warning(f"⚠️ 有 {dup_count} 道题重复（与已有题库或本次上传的文件之间重复），导入时会自动跳过。")
 
-            default_batch = f"{Path(uploaded.name).stem}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            default_batch = f"批量导入_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             batch_name = st.text_input("批次名称", value=default_batch)
 
             col1, col2 = st.columns(2)
@@ -792,7 +839,7 @@ D. 出口补贴
                         st.error("批次名不能为空。")
                     else:
                         with st.spinner("导入中..."):
-                            n, skipped = insert_questions(questions, batch_name.strip())
+                            n, skipped = insert_questions(all_questions, batch_name.strip())
                             invalidate_cache()
                         if skipped:
                             st.success(f"导入 {n} 道，跳过 {skipped} 道重复。")
@@ -803,8 +850,8 @@ D. 出口补贴
                 if st.button("🗑️ 放弃", use_container_width=True):
                     st.rerun()
 
-            with st.expander(f"查看全部 {len(questions)} 道（点击展开）", expanded=True):
-                for i, q in enumerate(questions, 1):
+            with st.expander(f"查看全部 {total_parsed} 道（点击展开）", expanded=False):
+                for i, q in enumerate(all_questions, 1):
                     is_dup = dup_flags[i - 1] if i - 1 < len(dup_flags) else False
                     tags = '<span class="dup-tag">重复</span>' if is_dup else ''
                     n_opts = len(q["options"])
@@ -821,7 +868,7 @@ D. 出口补贴
                         st.write(f"　**解析：** {q['explanation']}")
                     st.divider()
         else:
-            st.warning("没有解析出题目。")
+            st.warning("没有解析出任何题目。请检查文档格式。")
 
 
 # ---------- 管理题库 ----------
