@@ -6,7 +6,7 @@ import re, json, html, threading, random, os, time, traceback
 import pandas as pd
 from datetime import datetime
 
-st.set_page_config(page_title="海口边检辅警刷题系统", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="辅助人员刷题系统", layout="wide", initial_sidebar_state="collapsed")
 
 for k, v in [("font_size",20),("current_qid",None),("answered",False),("last_correct",None),
              ("last_user_answer",""),("all_done_choice",None),("case_idx",0),
